@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ml-on-canvas — ML algorithms visualized in vanilla canvas</title>
+<meta name="description" content="Five classic ML algorithms — k-means++, softmax regression, linear SVM, k-NN, and a decision tree — trained live in your browser on a vanilla canvas. Zero dependencies." />
+<style>
+  :root {
+    --bg: #f4f4f1;
+    --ink: #1b1b19;
+    --weak: #6e6c64;
+    --hairline: rgba(27, 27, 25, 0.14);
+    --panel: rgba(244, 244, 241, 0.72);
+    color-scheme: light;
+  }
+  [data-theme="dark"] {
+    --bg: #131311;
+    --ink: #eceae4;
+    --weak: #8f8d84;
+    --hairline: rgba(236, 234, 228, 0.16);
+    --panel: rgba(19, 19, 17, 0.72);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    transition: background 0.4s ease, color 0.4s ease;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+
+  header {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 18px 22px;
+    pointer-events: none;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+  header p { margin: 0; color: var(--weak); }
+  header a {
+    pointer-events: auto;
+    color: var(--weak); text-decoration: none;
+    border-bottom: 1px solid var(--hairline);
+    margin-left: auto;
+  }
+  header a:hover { color: var(--ink); border-bottom-color: var(--ink); }
+
+  .bar {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center;
+    max-width: calc(100vw - 24px);
+    padding: 8px;
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+  .bar button {
+    font: inherit; color: var(--weak);
+    background: none; border: 1px solid transparent; border-radius: 6px;
+    padding: 5px 10px; cursor: pointer;
+  }
+  .bar button:hover { color: var(--ink); }
+  .bar button[aria-pressed="true"] { color: var(--ink); border-color: var(--hairline); }
+  .bar .sep { width: 1px; align-self: stretch; background: var(--hairline); margin: 0 4px; }
+
+  .status {
+    position: fixed; left: 50%; bottom: 72px; transform: translateX(-50%);
+    color: var(--weak); font-size: 12.5px; letter-spacing: 0.02em;
+    padding: 3px 10px;
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    white-space: nowrap;
+  }
+  @media (max-width: 560px) {
+    header p { display: none; }
+  }
+</style>
+</head>
+<body>
+  <canvas id="viz" aria-hidden="true"></canvas>
+
+  <header>
+    <h1>ml-on-canvas</h1>
+    <p>ML algorithms visualized in vanilla canvas · zero dependencies</p>
+    <a href="https://github.com/funkekaiser/ml-on-canvas" target="_blank" rel="noopener">github ↗</a>
+  </header>
+
+  <div class="status" id="status" aria-live="off">&nbsp;</div>
+
+  <nav class="bar" aria-label="Demo controls">
+    <button type="button" data-algo="kmeans">k-means++</button>
+    <button type="button" data-algo="softmax">softmax</button>
+    <button type="button" data-algo="svm">svm</button>
+    <button type="button" data-algo="knn">k-nn</button>
+    <button type="button" data-algo="tree">tree</button>
+    <span class="sep" aria-hidden="true"></span>
+    <button type="button" id="regen">new data</button>
+    <button type="button" id="theme">dark</button>
+  </nav>
+
+  <script type="module">
+    import { createGallery } from "./ml-on-canvas.js";
+
+    const root = document.documentElement;
+    const schemeMq = window.matchMedia("(prefers-color-scheme: dark)");
+    if (schemeMq.matches) root.setAttribute("data-theme", "dark");
+    const isDark = () => root.getAttribute("data-theme") === "dark";
+
+    const statusEl = document.getElementById("status");
+    const algoBtns = [...document.querySelectorAll("[data-algo]")];
+    const markActive = (name) => {
+      algoBtns.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.algo === name)));
+    };
+
+    let gallery;
+    gallery = createGallery(document.getElementById("viz"), {
+      theme: isDark() ? "dark" : "light",
+      onStatus(label) {
+        statusEl.textContent = label;
+        if (gallery) markActive(gallery.getAlgorithm());
+      },
+    });
+    markActive(gallery.getAlgorithm());
+
+    algoBtns.forEach((b) => {
+      b.addEventListener("click", () => gallery.setAlgorithm(b.dataset.algo));
+    });
+    document.getElementById("regen").addEventListener("click", () => gallery.regenerate());
+
+    const themeBtn = document.getElementById("theme");
+    const applyTheme = (dark) => {
+      root.setAttribute("data-theme", dark ? "dark" : "light");
+      themeBtn.textContent = dark ? "light" : "dark";
+      gallery.setTheme(dark ? "dark" : "light");
+    };
+    themeBtn.textContent = isDark() ? "light" : "dark";
+    themeBtn.addEventListener("click", () => applyTheme(!isDark()));
+    schemeMq.addEventListener?.("change", (e) => applyTheme(e.matches));
+  </script>
+</body>
+</html>
