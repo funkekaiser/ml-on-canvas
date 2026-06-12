@@ -1,10 +1,12 @@
-# ml-on-canvas
+# ML on canvas
 
-**ML algorithms visualized in vanilla canvas — zero dependencies.**
+**ML algorithms visualized in vanilla canvas - zero dependencies.**
 
-Five classic classifiers cycle through a gallery, each one **trained live in your browser** on a freshly generated 2-D point cloud and rendered to a plain `<canvas>`: k-means++, softmax regression, linear SVM (one-vs-rest), k-NN, and a gini decision tree. No ML library, no framework, no build step — one ES module, ~600 lines.
+Five classic classifiers cycle through a gallery, each one **trained live in your browser** on a freshly generated 2-D point cloud and rendered to a plain `<canvas>`: k-means++, softmax regression, linear SVM (one-vs-rest), k-NN, and a gini decision tree. No ML library, no framework, no build step.
 
 **[▶ Live demo](https://funkekaiser.github.io/ml-on-canvas/)**
+
+![softmax regression training live on a 2-D point cloud, decision regions converging onto five clusters](assets/demo.gif)
 
 ## What you're watching
 
