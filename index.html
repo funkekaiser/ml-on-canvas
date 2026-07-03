@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ml-on-canvas — ML algorithms visualized in vanilla canvas</title>
-<meta name="description" content="Five classic ML algorithms — k-means++, softmax regression, linear SVM, k-NN, and a decision tree — trained live in your browser on a vanilla canvas. Zero dependencies." />
+<meta name="description" content="Seven classic ML algorithms — k-means++, softmax regression, linear SVM, k-NN, a tiny MLP, a decision tree, and a gaussian mixture (EM) — trained live in your browser on a vanilla canvas. Zero dependencies." />
 <style>
   :root {
     --bg: #f4f4f1;
@@ -101,7 +101,9 @@
     <button type="button" data-algo="softmax">softmax</button>
     <button type="button" data-algo="svm">svm</button>
     <button type="button" data-algo="knn">k-nn</button>
+    <button type="button" data-algo="mlp">mlp</button>
     <button type="button" data-algo="tree">tree</button>
+    <button type="button" data-algo="gmm">gmm</button>
     <span class="sep" aria-hidden="true"></span>
     <button type="button" id="regen">new data</button>
     <button type="button" id="theme">dark</button>

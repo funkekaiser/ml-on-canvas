@@ -1,14 +1,18 @@
 /* ml-on-canvas — classic ML algorithms trained live on a vanilla <canvas>.
  *
- * Five classifiers cycle through a gallery, each trained in real time on a
+ * Seven classifiers cycle through a gallery, each trained in real time on a
  * freshly generated 2-D point cloud: k-means++, softmax regression, linear
- * SVM (one-vs-rest, Pegasos), k-NN, and a gini decision tree.
+ * SVM (one-vs-rest, Pegasos), k-NN, a tiny MLP, a gini decision tree, and a
+ * gaussian mixture fit by EM. The nonlinear models occasionally get moons,
+ * rings, or anisotropic clouds instead of plain blobs — that's where their
+ * decision boundaries show character. After a few rounds with no pointer
+ * activity the gallery rests on a converged frame until you come back.
  *
  * Zero dependencies, no build step, one file.
  * https://github.com/funkekaiser/ml-on-canvas — MIT license.
  */
 
-export const ALGORITHMS = ["kmeans", "softmax", "svm", "knn", "tree"];
+export const ALGORITHMS = ["kmeans", "softmax", "svm", "knn", "mlp", "tree", "gmm"];
 
 /* Default palettes. `pal` entries are [r, g, b] cluster colors (one per
    cluster), brighter than what you would pick for text on the same bg. */
@@ -30,7 +34,7 @@ export const DEFAULT_THEMES = {
  * options:
  *   theme               "light" | "dark" (default "light")
  *   themes              palette overrides, same shape as DEFAULT_THEMES
- *   algorithms          subset/order of ALGORITHMS (default: all five)
+ *   algorithms          subset/order of ALGORITHMS (default: all seven)
  *   clusters            number of clusters K (default 5; palettes need K colors)
  *   pointsPerCluster    default 48
  *   respectReducedMotion  default true — render one static converged frame
@@ -83,14 +87,19 @@ export function createGallery(canvas, options = {}) {
   let w = 0, h = 0;
   let algoIdx = 0, algo = algos[0];
   let pts = [], phase = "in", t0 = 0, alpha = 0;
-  let cents = [], iter = 0, moved = 1e9;
-  let W = null, epoch = 0, acc = 0, svCount = 0;
+  let cents = [], iter = 0, moved = 1e9, inertia = 0;
+  let W = null, epoch = 0, acc = 0, loss = 0, svCount = 0;
+  let wSnap = null, wSnapEpoch = 0, svmDone = false;
+  const H = 8; /* mlp hidden width */
+  let W1 = null, W2 = null;
+  let comps = []; /* gmm components */
   let kNow = 1, kStepT = 0;
-  let tree = null, depthNow = 1, depthT = 0;
-  let layers = null, lastRegion = 0;
+  let tree = null, treeLevels = null, depthNow = 1, depthT = 0;
+  let layers = null, grid = null, lastRegion = 0;
   let dataC = null, dataR = 0, regFade = 0;
   let scene = null; /* cluster anchors for hover hit-testing */
   let lastLabel = null, lastHover = null;
+  let idleRounds = 0, idlePaused = false;
 
   const feat = (x, y) => {
     const s = 0.5 * Math.min(w, h);
@@ -109,6 +118,7 @@ export function createGallery(canvas, options = {}) {
   const stepSoftmax = () => {
     const lr = 0.12, n = pts.length;
     const G = W.map(() => [0, 0, 0]);
+    let L = 0;
     for (let i = 0; i < n; i++) {
       const p = pts[i];
       const f = feat(p.x, p.y);
@@ -116,12 +126,14 @@ export function createGallery(canvas, options = {}) {
       const mx = Math.max.apply(null, s);
       const ex = s.map((v) => Math.exp(v - mx));
       const Z = ex.reduce((a, b) => a + b, 0);
+      L -= Math.log(Math.max(ex[p.g] / Z, 1e-12));
       for (let k = 0; k < K; k++) {
         const e = ex[k] / Z - (p.g === k ? 1 : 0);
         G[k][0] += e * f[0]; G[k][1] += e * f[1]; G[k][2] += e * f[2];
       }
     }
     for (let k = 0; k < K; k++) for (let j = 0; j < 3; j++) W[k][j] -= (lr * G[k][j]) / n;
+    loss = L / n;
   };
   const stepSvm = () => {
     const lam = 0.0005, n = pts.length;
@@ -138,9 +150,31 @@ export function createGallery(canvas, options = {}) {
     }
     for (let k = 0; k < K; k++) for (let j = 0; j < 3; j++) W[k][j] -= lr * G[k][j];
   };
+  /* convergence for SVM: every 60 epochs, compare W against a snapshot —
+     the round ends when the margin has settled (relative drift < 1.2%),
+     not on a fixed epoch count */
+  const svmDrift = () => {
+    if (epoch - wSnapEpoch < 60) return;
+    if (wSnap) {
+      let d2 = 0, n2 = 0;
+      for (let k = 0; k < K; k++) {
+        for (let j = 0; j < 3; j++) {
+          const dv = W[k][j] - wSnap[k][j];
+          d2 += dv * dv; n2 += W[k][j] * W[k][j];
+        }
+      }
+      svmDone = Math.sqrt(d2 / Math.max(n2, 1e-12)) < 0.012;
+    }
+    wSnap = W.map((r) => r.slice());
+    wSnapEpoch = epoch;
+  };
   const calcAcc = () => {
     let c = 0;
-    for (let i = 0; i < pts.length; i++) if (predictLinear(feat(pts[i].x, pts[i].y)) === pts[i].g) c++;
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const g = algo === "mlp" ? predictMlp(p.x, p.y) : predictLinear(feat(p.x, p.y));
+      if (g === p.g) c++;
+    }
     return c / pts.length;
   };
   const markSVs = () => {
@@ -167,6 +201,56 @@ export function createGallery(canvas, options = {}) {
     for (let k = 1; k < K; k++) if (cnt[k] > cnt[bi]) bi = k;
     return bi;
   };
+
+  /* ---- mlp: 2 → H → K, tanh hidden layer, full-batch GD on
+     cross-entropy — curved boundaries next to the linear models ---- */
+  const predictMlp = (x, y) => {
+    const f = feat(x, y), hb = new Array(H);
+    for (let j = 0; j < H; j++) hb[j] = Math.tanh(W1[j][0] * f[0] + W1[j][1] * f[1] + W1[j][2]);
+    let bi = 0, bs = -1e18;
+    for (let k = 0; k < K; k++) {
+      let s = W2[k][H];
+      for (let j = 0; j < H; j++) s += W2[k][j] * hb[j];
+      if (s > bs) { bs = s; bi = k; }
+    }
+    return bi;
+  };
+  const stepMlp = () => {
+    const lr = 0.6, n = pts.length;
+    const G1 = W1.map(() => [0, 0, 0]);
+    const G2 = W2.map(() => new Array(H + 1).fill(0));
+    const hb = new Array(H), s = new Array(K), err = new Array(K);
+    let L = 0;
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      const f = feat(p.x, p.y);
+      for (let j = 0; j < H; j++) hb[j] = Math.tanh(W1[j][0] * f[0] + W1[j][1] * f[1] + W1[j][2]);
+      let mx = -1e18;
+      for (let k = 0; k < K; k++) {
+        let v = W2[k][H];
+        for (let j = 0; j < H; j++) v += W2[k][j] * hb[j];
+        s[k] = v; if (v > mx) mx = v;
+      }
+      let Z = 0;
+      for (let k = 0; k < K; k++) { s[k] = Math.exp(s[k] - mx); Z += s[k]; }
+      L -= Math.log(Math.max(s[p.g] / Z, 1e-12));
+      for (let k = 0; k < K; k++) {
+        err[k] = s[k] / Z - (p.g === k ? 1 : 0);
+        for (let j = 0; j < H; j++) G2[k][j] += err[k] * hb[j];
+        G2[k][H] += err[k];
+      }
+      for (let j = 0; j < H; j++) {
+        let dh = 0;
+        for (let k = 0; k < K; k++) dh += err[k] * W2[k][j];
+        const dz = dh * (1 - hb[j] * hb[j]);
+        G1[j][0] += dz * f[0]; G1[j][1] += dz * f[1]; G1[j][2] += dz * f[2];
+      }
+    }
+    for (let k = 0; k < K; k++) for (let j = 0; j <= H; j++) W2[k][j] -= (lr * G2[k][j]) / n;
+    for (let j = 0; j < H; j++) for (let q = 0; q < 3; q++) W1[j][q] -= (lr * G1[j][q]) / n;
+    loss = L / n;
+  };
+
   const buildTree = () => {
     const gini = (idxs) => {
       const c = new Array(K).fill(0);
@@ -184,15 +268,17 @@ export function createGallery(canvas, options = {}) {
       return bi;
     };
     const split = (idxs, depth) => {
-      const node = { leaf: true, cls: majority(idxs), depth };
+      let x0 = 1e18, x1 = -1e18, y0 = 1e18, y1 = -1e18;
+      for (let i = 0; i < idxs.length; i++) {
+        const p = pts[idxs[i]];
+        if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+        if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+      }
+      const node = { leaf: true, cls: majority(idxs), depth, x0, x1, y0, y1 };
       if (depth >= 3 || idxs.length < 12 || gini(idxs) < 0.05) return node;
       let best = null;
       for (let ax = 0; ax <= 1; ax++) {
-        let lo = 1e18, hi = -1e18;
-        for (let i = 0; i < idxs.length; i++) {
-          const v = ax ? pts[idxs[i]].y : pts[idxs[i]].x;
-          if (v < lo) lo = v; if (v > hi) hi = v;
-        }
+        const lo = ax ? y0 : x0, hi = ax ? y1 : x1;
         for (let q = 1; q < 16; q++) {
           const thr = lo + ((hi - lo) * q) / 16;
           const L = [], R = [];
@@ -210,7 +296,16 @@ export function createGallery(canvas, options = {}) {
       node.r = split(best.R, depth + 1);
       return node;
     };
-    return split(pts.map((_, i) => i), 0);
+    const root = split(pts.map((_, i) => i), 0);
+    /* internal nodes grouped by depth — the sweep animation walks these */
+    treeLevels = [[], [], [], []];
+    const walk = (n) => {
+      if (!n || n.leaf) return;
+      treeLevels[n.depth].push(n);
+      walk(n.l); walk(n.r);
+    };
+    walk(root);
+    return root;
   };
   const predictTree = (x, y) => {
     let n = tree;
@@ -218,28 +313,102 @@ export function createGallery(canvas, options = {}) {
     return n ? n.cls : 0;
   };
 
-  /* ---- decision-region layers (one offscreen canvas per class, masked
-     to a soft radial zone around the data so the page never tints) ---- */
+  /* ---- gmm: full-covariance gaussian mixture fit by EM. Soft
+     responsibilities blend the point colors; 1σ/2σ ellipses animate
+     with the M-step like the k-means centroids do ---- */
+  const gmmScore = (m, x, y) => {
+    const det = m.a * m.c - m.b * m.b;
+    const dx = x - m.x, dy = y - m.y;
+    const q = (m.c * dx * dx - 2 * m.b * dx * dy + m.a * dy * dy) / det;
+    return Math.log(Math.max(m.pi, 1e-12)) - 0.5 * q - 0.5 * Math.log(det);
+  };
+  const predictGmm = (x, y) => {
+    let bi = 0, bs = -1e18;
+    for (let k = 0; k < comps.length; k++) {
+      const s = gmmScore(comps[k], x, y);
+      if (s > bs) { bs = s; bi = k; }
+    }
+    return bi;
+  };
+  const eStep = () => {
+    const lp = new Array(K);
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      let mx = -1e18;
+      for (let k = 0; k < K; k++) { lp[k] = gmmScore(comps[k], p.x, p.y); if (lp[k] > mx) mx = lp[k]; }
+      let Z = 0;
+      for (let k = 0; k < K; k++) { lp[k] = Math.exp(lp[k] - mx); Z += lp[k]; }
+      p.r = new Array(K);
+      let bi = 0;
+      for (let k = 0; k < K; k++) {
+        p.r[k] = lp[k] / Z;
+        if (p.r[k] > p.r[bi]) bi = k;
+      }
+      p.c = bi;
+    }
+  };
+  const mStep = () => {
+    const n = pts.length, reg = Math.pow(Math.min(w, h) * 0.012, 2);
+    let mv = 0;
+    for (let k = 0; k < comps.length; k++) {
+      let Nk = 1e-6, sx = 0, sy = 0;
+      for (let i = 0; i < n; i++) { const r = pts[i].r[k]; Nk += r; sx += r * pts[i].x; sy += r * pts[i].y; }
+      const mx = sx / Nk, my = sy / Nk;
+      let sa = 0, sb = 0, sc = 0;
+      for (let i = 0; i < n; i++) {
+        const r = pts[i].r[k], dx = pts[i].x - mx, dy = pts[i].y - my;
+        sa += r * dx * dx; sb += r * dx * dy; sc += r * dy * dy;
+      }
+      const m = comps[k];
+      m.fx = m.x; m.fy = m.y; m.fa = m.a; m.fb = m.b; m.fc = m.c;
+      m.tx = mx; m.ty = my;
+      m.ta = sa / Nk + reg; m.tb = sb / Nk; m.tc = sc / Nk + reg;
+      m.pi = Nk / n;
+      mv = Math.max(mv, Math.hypot(m.tx - m.fx, m.ty - m.fy));
+    }
+    return mv;
+  };
+
+  /* ---- decision-region layers. Classes are predicted on a coarse grid
+     into one tiny gridW×gridH canvas per class, scaled up with smoothing
+     off (same blocky look, ~10× less fill work), then masked to a soft
+     radial zone around the data so the page never tints ---- */
   const renderLayers = () => {
     if (!layers || algo === "kmeans") return;
     const T = cur();
-    const cell = Math.max(16, Math.round(Math.min(w, h) / 42));
-    for (let l = 0; l < layers.length; l++) layers[l].ctx.clearRect(0, 0, w, h);
-    for (let y = 0; y < h + cell; y += cell) {
-      for (let x = 0; x < w + cell; x += cell) {
-        let cls;
-        if (algo === "softmax" || algo === "svm") cls = predictLinear(feat(x + cell / 2, y + cell / 2));
-        else if (algo === "knn") cls = predictKnn(x + cell / 2, y + cell / 2);
-        else cls = predictTree(x + cell / 2, y + cell / 2);
-        const col = T.pal[cls];
-        const lc = layers[cls].ctx;
-        lc.fillStyle = "rgb(" + col[0] + "," + col[1] + "," + col[2] + ")";
-        lc.fillRect(x, y, cell + 1, cell + 1);
+    const cell = Math.max(12, Math.round(Math.min(w, h) / 56));
+    const gw = Math.ceil(w / cell) + 1, gh = Math.ceil(h / cell) + 1;
+    if (!grid || grid.cell !== cell || grid.gw !== gw || grid.gh !== gh) {
+      grid = { cell, gw, gh, cvs: [] };
+      for (let k = 0; k < K; k++) {
+        const cv = document.createElement("canvas");
+        cv.width = gw; cv.height = gh;
+        grid.cvs.push({ cv, ctx: cv.getContext("2d") });
       }
     }
-    if (dataC) {
-      for (let l2 = 0; l2 < layers.length; l2++) {
-        const L = layers[l2];
+    for (let k = 0; k < K; k++) {
+      const gc = grid.cvs[k].ctx, col = T.pal[k];
+      gc.clearRect(0, 0, gw, gh);
+      gc.fillStyle = "rgb(" + col[0] + "," + col[1] + "," + col[2] + ")";
+    }
+    for (let gy = 0; gy < gh; gy++) {
+      for (let gx = 0; gx < gw; gx++) {
+        const x = gx * cell + cell / 2, y = gy * cell + cell / 2;
+        let cls;
+        if (algo === "softmax" || algo === "svm") cls = predictLinear(feat(x, y));
+        else if (algo === "mlp") cls = predictMlp(x, y);
+        else if (algo === "knn") cls = predictKnn(x, y);
+        else if (algo === "gmm") cls = predictGmm(x, y);
+        else cls = predictTree(x, y);
+        grid.cvs[cls].ctx.fillRect(gx, gy, 1, 1);
+      }
+    }
+    for (let l = 0; l < layers.length; l++) {
+      const L = layers[l];
+      L.ctx.clearRect(0, 0, w, h);
+      L.ctx.imageSmoothingEnabled = false;
+      L.ctx.drawImage(grid.cvs[l].cv, 0, 0, gw, gh, 0, 0, gw * cell, gh * cell);
+      if (dataC) {
         const g = L.ctx.createRadialGradient(dataC.x, dataC.y, dataR * 0.5, dataC.x, dataC.y, dataR);
         g.addColorStop(0, "rgba(0,0,0,1)");
         g.addColorStop(1, "rgba(0,0,0,0)");
@@ -252,15 +421,49 @@ export function createGallery(canvas, options = {}) {
   };
 
   /* ---- round setup ---- */
+  const seedPP = () => {
+    /* k-means++ seeding: spread initial centers ∝ squared distance */
+    const first = pts[(Math.random() * pts.length) | 0];
+    const seeds = [[first.x, first.y]];
+    while (seeds.length < K) {
+      const d2 = pts.map((p) => {
+        let m = 1e18;
+        for (let si = 0; si < seeds.length; si++) {
+          const dx = p.x - seeds[si][0], dy = p.y - seeds[si][1];
+          m = Math.min(m, dx * dx + dy * dy);
+        }
+        return m;
+      });
+      const total = d2.reduce((a, b) => a + b, 0);
+      let r = Math.random() * total, pick = 0;
+      for (let di = 0; di < d2.length; di++) { r -= d2[di]; if (r <= 0) { pick = di; break; } }
+      seeds.push([pts[pick].x, pts[pick].y]);
+    }
+    return seeds;
+  };
+
   const newRound = () => {
     algo = algos[algoIdx % algos.length];
     algoIdx++;
+    /* the nonlinear models sometimes get data that a line can't carve —
+       per-cluster moons, rings, or anisotropic clouds. GMM gets anisotropic
+       rounds (its covariance ellipses stretch to fit); the linear models
+       keep gaussian blobs. */
+    let shapes = null;
+    if ((algo === "knn" || algo === "tree" || algo === "mlp") && Math.random() < 0.55) {
+      const SHAPES = ["blob", "moon", "ring", "aniso"];
+      shapes = [];
+      for (let k = 0; k < K; k++) shapes.push(SHAPES[(Math.random() * SHAPES.length) | 0]);
+    } else if (algo === "gmm" && Math.random() < 0.6) {
+      shapes = [];
+      for (let k = 0; k < K; k++) shapes.push("aniso");
+    }
     const ctr = [];
     const box = placement(w, h);
     const xLo = box.x[0], xHi = box.x[1];
     const yLo = (box.y && box.y[0]) != null ? box.y[0] : 0.16;
     const yHi = (box.y && box.y[1]) != null ? box.y[1] : 0.84;
-    const sep = Math.min(w, h) * box.sep;
+    const sep = Math.min(w, h) * box.sep * (shapes ? 1.3 : 1);
     let guard = 0;
     while (ctr.length < K && guard++ < 300) {
       const c = [rnd(xLo, xHi) * w, rnd(yLo, yHi) * h];
@@ -271,35 +474,45 @@ export function createGallery(canvas, options = {}) {
       if (ok) ctr.push(c);
     }
     pts = [];
+    const soft = algo === "kmeans" || algo === "gmm"; /* points start gray */
     ctr.forEach((c, gi) => {
       const s = Math.min(w, h) * rnd(0.085, 0.125);
+      const shape = shapes ? shapes[gi] : "blob";
+      const th = rnd(0, Math.PI * 2), cosT = Math.cos(th), sinT = Math.sin(th);
       for (let i = 0; i < PPC; i++) {
-        pts.push({ x: c[0] + gauss() * s, y: c[1] + gauss() * s, g: gi, c: algo === "kmeans" ? -1 : gi, mix: 0, sv: false });
+        let dx, dy;
+        if (shape === "ring") {
+          const a = rnd(0, Math.PI * 2), r = s * rnd(1.15, 1.35);
+          dx = Math.cos(a) * r + gauss() * s * 0.22;
+          dy = Math.sin(a) * r + gauss() * s * 0.22;
+        } else if (shape === "moon") {
+          const a = th + rnd(0, Math.PI), r = s * rnd(1.2, 1.4);
+          dx = Math.cos(a) * r + gauss() * s * 0.25;
+          dy = Math.sin(a) * r + gauss() * s * 0.25;
+        } else if (shape === "aniso") {
+          const u = gauss() * s * 1.7, v = gauss() * s * 0.5;
+          dx = u * cosT - v * sinT;
+          dy = u * sinT + v * cosT;
+        } else {
+          dx = gauss() * s; dy = gauss() * s;
+        }
+        pts.push({ x: c[0] + dx, y: c[1] + dy, g: gi, c: soft ? -1 : gi, mix: 0, sv: false });
       }
     });
     if (algo === "kmeans") {
-      /* k-means++ seeding: spread initial centroids ∝ squared distance */
       cents = [];
-      const first = pts[(Math.random() * pts.length) | 0];
-      const seeds = [[first.x, first.y]];
-      while (seeds.length < K) {
-        const d2 = pts.map((p) => {
-          let m = 1e18;
-          for (let si = 0; si < seeds.length; si++) {
-            const dx = p.x - seeds[si][0], dy = p.y - seeds[si][1];
-            m = Math.min(m, dx * dx + dy * dy);
-          }
-          return m;
-        });
-        const total = d2.reduce((a, b) => a + b, 0);
-        let r = Math.random() * total, pick = 0;
-        for (let di = 0; di < d2.length; di++) { r -= d2[di]; if (r <= 0) { pick = di; break; } }
-        seeds.push([pts[pick].x, pts[pick].y]);
-      }
-      seeds.forEach((s) => {
+      seedPP().forEach((s) => {
         cents.push({ x: s[0], y: s[1], fx: s[0], fy: s[1], tx: s[0], ty: s[1], trail: [] });
       });
       scene = { cents };
+    } else if (algo === "gmm") {
+      const s0 = Math.pow(Math.min(w, h) * 0.07, 2);
+      comps = seedPP().map((s) => ({
+        x: s[0], y: s[1], fx: s[0], fy: s[1], tx: s[0], ty: s[1],
+        a: s0, b: 0, c: s0, fa: s0, fb: 0, fc: s0, ta: s0, tb: 0, tc: s0,
+        pi: 1 / K,
+      }));
+      scene = { cents: comps };
     } else {
       scene = { cents: ctr.map((c) => ({ x: c[0], y: c[1] })) };
     }
@@ -307,10 +520,21 @@ export function createGallery(canvas, options = {}) {
       W = [];
       for (let k = 0; k < K; k++) W.push([rnd(-1, 1), rnd(-1, 1), rnd(-0.3, 0.3)]);
       epoch = 0; acc = 0; svCount = 0;
+      wSnap = null; wSnapEpoch = 0; svmDone = false;
+    }
+    if (algo === "mlp") {
+      W1 = []; W2 = [];
+      for (let j = 0; j < H; j++) W1.push([rnd(-1.2, 1.2), rnd(-1.2, 1.2), rnd(-0.6, 0.6)]);
+      for (let k = 0; k < K; k++) {
+        const row = [];
+        for (let j = 0; j <= H; j++) row.push(rnd(-0.5, 0.5));
+        W2.push(row);
+      }
+      epoch = 0; acc = 0;
     }
     if (algo === "knn") { kNow = 1; kStepT = 0; }
-    if (algo === "tree") { tree = buildTree(); depthNow = 1; depthT = 0; }
-    iter = 0; moved = 1e9; regFade = 0;
+    if (algo === "tree") { tree = buildTree(); depthNow = 0; depthT = 0; }
+    iter = 0; moved = 1e9; regFade = 0; inertia = 0; loss = 0;
     let mx = 0, my = 0;
     for (let ci = 0; ci < ctr.length; ci++) { mx += ctr[ci][0]; my += ctr[ci][1]; }
     dataC = { x: mx / ctr.length, y: my / ctr.length };
@@ -328,6 +552,7 @@ export function createGallery(canvas, options = {}) {
     canvas.width = Math.round(w * DPR); canvas.height = Math.round(h * DPR);
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     layers = [];
+    grid = null;
     for (let k = 0; k < K; k++) {
       const cv = document.createElement("canvas");
       cv.width = w; cv.height = h;
@@ -337,6 +562,7 @@ export function createGallery(canvas, options = {}) {
 
   /* ---- k-means helpers ---- */
   const assign = () => {
+    let s2 = 0;
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
       let bi = 0, bd = 1e18;
@@ -345,7 +571,10 @@ export function createGallery(canvas, options = {}) {
         if (d < bd) { bd = d; bi = k; }
       }
       if (p.c !== bi) { p.c = bi; p.mix = 0; }
+      s2 += bd;
     }
+    const sc = 0.5 * Math.min(w, h); /* WCSS in unit coords for the readout */
+    inertia = s2 / (pts.length * sc * sc);
   };
   const setTargets = () => {
     let mv = 0;
@@ -369,7 +598,19 @@ export function createGallery(canvas, options = {}) {
   let flashK = null, flashUntil = 0, tapX = 0, tapY = 0;
   const hoverMq = window.matchMedia("(hover: hover) and (pointer: fine)");
 
+  /* any pointer activity resets the idle counter and wakes a resting
+     gallery (battery: after ~3 untouched rounds we pause on a converged
+     frame instead of looping forever) */
+  const noteActivity = () => {
+    idleRounds = 0;
+    if (idlePaused) {
+      t0 = performance.now(); /* re-hold the resting frame before moving on */
+      start();
+    }
+  };
+
   const onPointerMove = (e) => {
+    noteActivity();
     /* touch "moves" are taps/scrolls, not hover — they'd freeze the
        highlight at the last touched point */
     if (e.pointerType !== "mouse" || !hoverMq.matches) { canvasHover = null; return; }
@@ -388,10 +629,12 @@ export function createGallery(canvas, options = {}) {
      elements (tapIgnore selector) are left alone, and a drag (scroll) is
      ignored. The flash rides the same hover pipeline. */
   const onPointerDown = (e) => {
+    noteActivity();
     if (e.pointerType === "mouse") return;
     tapX = e.clientX; tapY = e.clientY;
   };
   const onPointerUp = (e) => {
+    noteActivity();
     if (e.pointerType === "mouse") return;
     if (Math.hypot(e.clientX - tapX, e.clientY - tapY) > 12) return; /* scroll, not tap */
     if (e.target && e.target.closest && e.target.closest(tapIgnore)) return;
@@ -419,7 +662,7 @@ export function createGallery(canvas, options = {}) {
     ctx.fillRect(0, 0, w, h);
 
     if (algo !== "kmeans" && layers && regFade > 0.015) {
-      const RA = isDark() ? [0.20, 0.34, 0.10] : [0.15, 0.27, 0.07];
+      const RA = isDark() ? [0.26, 0.42, 0.13] : [0.15, 0.27, 0.07];
       for (let k = 0; k < K; k++) {
         ctx.globalAlpha = alpha * regFade * (hk == null ? RA[0] : hk === k ? RA[1] : RA[2]);
         ctx.drawImage(layers[k].cv, 0, 0, w, h);
@@ -431,7 +674,17 @@ export function createGallery(canvas, options = {}) {
     ctx.globalAlpha = alpha;
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
-      const col = p.c < 0 ? T.gray : mixc(T.gray, T.pal[p.c], p.mix);
+      let col;
+      if (p.c < 0) col = T.gray;
+      else if (algo === "gmm" && p.r) {
+        /* soft assignment: blend the palette by responsibility */
+        let cr = 0, cg = 0, cb = 0;
+        for (let k = 0; k < K; k++) {
+          const rk = p.r[k];
+          cr += rk * T.pal[k][0]; cg += rk * T.pal[k][1]; cb += rk * T.pal[k][2];
+        }
+        col = mixc(T.gray, [cr, cg, cb], p.mix);
+      } else col = mixc(T.gray, T.pal[p.c], p.mix);
       const lit = hk != null && p.c === hk;
       const dim = hk != null && p.c !== hk;
       ctx.fillStyle = "rgba(" + col[0] + "," + col[1] + "," + col[2] + "," + (dim ? 0.15 : lit ? 0.95 : 0.75) + ")";
@@ -464,16 +717,71 @@ export function createGallery(canvas, options = {}) {
         ctx.beginPath(); ctx.arc(c.x, c.y, 1.5, 0, 6.2832); ctx.fill();
       }
     }
+    if (algo === "gmm") {
+      for (let k2 = 0; k2 < comps.length; k2++) {
+        const m = comps[k2], ccol = T.pal[k2];
+        const cdim = hk != null && k2 !== hk;
+        /* 1σ/2σ ellipses from the covariance eigendecomposition */
+        const mid = (m.a + m.c) / 2, half = (m.a - m.c) / 2;
+        const d = Math.sqrt(half * half + m.b * m.b);
+        const r1 = Math.sqrt(Math.max(mid + d, 1)), r2 = Math.sqrt(Math.max(mid - d, 1));
+        const ang = 0.5 * Math.atan2(2 * m.b, m.a - m.c);
+        ctx.strokeStyle = "rgba(" + ccol[0] + "," + ccol[1] + "," + ccol[2] + "," + (cdim ? 0.28 : 0.85) + ")";
+        ctx.lineWidth = hk === k2 ? 2.5 : 1.5;
+        ctx.beginPath(); ctx.ellipse(m.x, m.y, r1, r2, ang, 0, 6.2832); ctx.stroke();
+        ctx.strokeStyle = "rgba(" + ccol[0] + "," + ccol[1] + "," + ccol[2] + "," + (cdim ? 0.10 : 0.30) + ")";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.ellipse(m.x, m.y, r1 * 2, r2 * 2, ang, 0, 6.2832); ctx.stroke();
+        ctx.fillStyle = T.ink;
+        ctx.beginPath(); ctx.arc(m.x, m.y, 1.5, 0, 6.2832); ctx.fill();
+      }
+    }
+    if (algo === "tree" && phase === "run" && depthNow < 3 && treeLevels) {
+      /* threshold sweep: the candidate split line scans the node, eases
+         back, and locks at the chosen threshold before the region splits */
+      const nodes = treeLevels[depthNow];
+      const u = Math.min(1, (performance.now() - depthT) / 1400);
+      for (let ni = 0; ni < nodes.length; ni++) {
+        const nd = nodes[ni];
+        const lo = nd.ax ? nd.y0 : nd.x0, hi = nd.ax ? nd.y1 : nd.x1;
+        const locked = u >= 0.8;
+        let pos;
+        if (u < 0.55) pos = lo + (hi - lo) * ease(u / 0.55);
+        else if (!locked) pos = hi + (nd.thr - hi) * ease((u - 0.55) / 0.25);
+        else pos = nd.thr;
+        ctx.strokeStyle = "rgba(" + T.ring + "," + (locked ? 0.6 : 0.28) + ")";
+        ctx.lineWidth = 1;
+        if (!locked) ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        if (nd.ax) { ctx.moveTo(nd.x0 - 14, pos); ctx.lineTo(nd.x1 + 14, pos); }
+        else { ctx.moveTo(pos, nd.y0 - 14); ctx.lineTo(pos, nd.y1 + 14); }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
     ctx.restore();
   };
 
   const setLabel = () => {
     let label;
-    if (algo === "kmeans") label = "k-means++ · k = " + K + " · iter " + pad(iter, 2);
-    else if (algo === "softmax") label = "softmax regression · epoch " + pad(epoch, 3) + " · acc " + acc.toFixed(2);
-    else if (algo === "svm") label = "linear svm (ovr) · epoch " + pad(epoch, 4) + (svCount ? " · sv " + svCount : "");
-    else if (algo === "knn") label = "k-nn · k = " + kNow + " · " + pts.length + " samples";
-    else label = "decision tree · depth " + depthNow + " · gini";
+    if (algo === "kmeans") {
+      label = "k-means++ · k = " + K + " · iter " + pad(iter, 2) +
+        (inertia ? " · wcss " + inertia.toFixed(3) : "");
+    } else if (algo === "softmax") {
+      label = "softmax regression · epoch " + pad(epoch, 3) +
+        (loss ? " · loss " + loss.toFixed(2) : "") + " · acc " + acc.toFixed(2);
+    } else if (algo === "svm") {
+      label = "linear svm (ovr) · epoch " + pad(epoch, 4) + (svCount ? " · sv " + svCount : "");
+    } else if (algo === "knn") {
+      label = "k-nn · k = " + kNow + " · " + pts.length + " samples";
+    } else if (algo === "mlp") {
+      label = "mlp 2·" + H + "·" + K + " · epoch " + pad(epoch, 3) +
+        (loss ? " · loss " + loss.toFixed(2) : "") + " · acc " + acc.toFixed(2);
+    } else if (algo === "gmm") {
+      label = "gmm (em) · k = " + K + " · iter " + pad(iter, 2);
+    } else {
+      label = "decision tree · depth " + depthNow + " · gini";
+    }
     if (label !== lastLabel) {
       lastLabel = label;
       if (onStatus) onStatus(label);
@@ -494,6 +802,7 @@ export function createGallery(canvas, options = {}) {
       if (alpha >= 1) {
         t0 = now;
         if (algo === "kmeans") { assign(); phase = "assign"; }
+        else if (algo === "gmm") { eStep(); renderLayers(); phase = "assign"; }
         else {
           phase = "run";
           lastRegion = 0;
@@ -502,28 +811,49 @@ export function createGallery(canvas, options = {}) {
         }
       }
     } else if (phase === "assign") {
-      if (now - t0 > 900) { moved = setTargets(); phase = "move"; t0 = now; }
+      if (now - t0 > 900) {
+        moved = algo === "gmm" ? mStep() : setTargets();
+        phase = "move"; t0 = now;
+      }
     } else if (phase === "move") {
       const u = Math.min(1, (now - t0) / 1000), e = ease(u);
-      for (let ci = 0; ci < cents.length; ci++) {
-        const c = cents[ci];
-        c.x = c.fx + (c.tx - c.fx) * e; c.y = c.fy + (c.ty - c.fy) * e;
+      if (algo === "gmm") {
+        for (let ci = 0; ci < comps.length; ci++) {
+          const m = comps[ci];
+          m.x = m.fx + (m.tx - m.fx) * e; m.y = m.fy + (m.ty - m.fy) * e;
+          m.a = m.fa + (m.ta - m.fa) * e; m.b = m.fb + (m.tb - m.fb) * e; m.c = m.fc + (m.tc - m.fc) * e;
+        }
+        /* regions morph along with the animated means/covariances */
+        if (now - lastRegion > 90) { renderLayers(); lastRegion = now; }
+      } else {
+        for (let ci = 0; ci < cents.length; ci++) {
+          const c = cents[ci];
+          c.x = c.fx + (c.tx - c.fx) * e; c.y = c.fy + (c.ty - c.fy) * e;
+        }
       }
       if (u >= 1) {
         iter++;
-        if (iter >= 9 || moved < Math.min(w, h) * 0.004) { phase = "hold"; t0 = now; }
-        else { assign(); phase = "assign"; t0 = now; }
+        const maxIter = algo === "gmm" ? 10 : 9;
+        if (iter >= maxIter || moved < Math.min(w, h) * 0.004) {
+          if (algo === "gmm") { eStep(); renderLayers(); }
+          phase = "hold"; t0 = now;
+        } else {
+          if (algo === "gmm") { eStep(); renderLayers(); } else assign();
+          phase = "assign"; t0 = now;
+        }
       }
     } else if (phase === "run") {
-      if (algo === "softmax" || algo === "svm") {
-        (algo === "softmax" ? stepSoftmax : stepSvm)();
-        epoch++;
-        if (algo === "svm") { stepSvm(); epoch++; } /* 2 epochs/frame */
+      if (algo === "softmax" || algo === "svm" || algo === "mlp") {
+        if (algo === "softmax") { stepSoftmax(); epoch++; }
+        else if (algo === "svm") { stepSvm(); epoch++; svmDrift(); stepSvm(); epoch++; svmDrift(); }
+        else { stepMlp(); epoch++; stepMlp(); epoch++; stepMlp(); epoch++; }
         if (now - lastRegion > 70) { renderLayers(); lastRegion = now; }
-        if (epoch % 5 === 0) acc = calcAcc();
+        if (algo !== "svm") acc = calcAcc();
         const done = algo === "svm"
-          ? epoch >= 1200 /* margin scale needs convergence, not argmax acc */
-          : epoch >= 800 || (epoch > 200 && acc >= 0.99);
+          ? epoch >= 1600 || (epoch > 300 && svmDone) /* margin settled */
+          : algo === "mlp"
+            ? epoch >= 1000 || (epoch > 250 && acc >= 0.985)
+            : epoch >= 800 || (epoch > 200 && acc >= 0.99);
         if (done) {
           acc = calcAcc();
           if (algo === "svm") markSVs();
@@ -536,16 +866,22 @@ export function createGallery(canvas, options = {}) {
           else { kNow += 2; renderLayers(); kStepT = now; }
         }
       } else {
-        if (now - depthT > 1300) {
-          if (depthNow >= 3) { phase = "hold"; t0 = now; }
-          else { depthNow++; renderLayers(); depthT = now; }
+        if (depthNow >= 3) {
+          if (now - depthT > 500) { phase = "hold"; t0 = now; }
+        } else if (now - depthT > 1400) {
+          depthNow++; renderLayers(); depthT = now;
         }
       }
     } else if (phase === "hold") {
-      if (now - t0 > 3600) { phase = "out"; t0 = now; }
+      if (now - t0 > 3600) {
+        /* after ~3 rounds with no pointer activity, rest on this converged
+           frame — noteActivity() resumes the loop */
+        if (idleRounds >= 3) idlePaused = true;
+        else { phase = "out"; t0 = now; }
+      }
     } else {
       alpha = Math.max(0, 1 - (now - t0) / 600);
-      if (alpha <= 0) newRound();
+      if (alpha <= 0) { idleRounds++; newRound(); }
     }
     for (let pi = 0; pi < pts.length; pi++) pts[pi].mix = Math.min(1, pts[pi].mix + dt * 2.2);
 
@@ -555,9 +891,11 @@ export function createGallery(canvas, options = {}) {
     drawFrame();
     notifyHover();
     setLabel();
+    if (idlePaused) { rafId = null; return; }
     rafId = requestAnimationFrame(tick);
   };
   const start = () => {
+    idlePaused = false;
     if (rafId == null && !reduced) {
       last = performance.now();
       rafId = requestAnimationFrame(tick);
@@ -591,8 +929,29 @@ export function createGallery(canvas, options = {}) {
         }
         acc = calcAcc();
       } else if (algo === "svm") {
-        while (epoch < 1200) { stepSvm(); epoch++; }
+        while (epoch < 1600) {
+          stepSvm(); epoch++; svmDrift();
+          if (epoch > 300 && svmDone) break;
+        }
         acc = calcAcc(); markSVs();
+      } else if (algo === "mlp") {
+        while (epoch < 1000) {
+          stepMlp(); epoch++;
+          if (epoch % 10 === 0 && epoch > 250 && (acc = calcAcc()) >= 0.985) break;
+        }
+        acc = calcAcc();
+      } else if (algo === "gmm") {
+        for (let it = 0; it < 10; it++) {
+          eStep();
+          const mv = mStep();
+          for (let ci = 0; ci < comps.length; ci++) {
+            const m = comps[ci];
+            m.x = m.tx; m.y = m.ty; m.a = m.ta; m.b = m.tb; m.c = m.tc;
+          }
+          iter++;
+          if (mv < Math.min(w, h) * 0.004) break;
+        }
+        eStep();
       } else if (algo === "knn") {
         kNow = 9;
       } else {
@@ -664,6 +1023,7 @@ export function createGallery(canvas, options = {}) {
 
   function setAlgorithm(name) {
     if (!algos.includes(name)) return;
+    idleRounds = 0;
     if (reduced) { staticScene(name); return; }
     algoIdx = algos.indexOf(name);
     newRound();
